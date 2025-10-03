@@ -1,0 +1,57 @@
+{
+  "rpcUrls": [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-mainnet.rpc.extrnode.com",
+    "https://ssc-dao.genesysgo.net"
+  ],
+  "maxSlippageBps": 100,
+  "tradeDelayMs": {
+    "min": 1000,
+    "max": 5000
+  },
+  "volumeBoost": {
+    "targetMultiplier": 5,
+    "buySellRatio": 0.7
+  },
+  "marketMaking": {
+    "spreadTiers": [0.005, 0.01, 0.02],
+    "rebalanceThreshold": 1000,
+    "minSpread": 0.001,
+    "maxSpread": 0.05
+  },
+  "orbittMode": {
+    "enabled": false,
+    "surgeMultiplier": 4,
+    "minSignalStrength": 0.7
+  },
+  "wallets": {
+    "batchSize": 50,
+    "rotationStrategy": "fisher-yates",
+    "minBalanceSOL": 0.01
+  },
+  "monitoring": {
+    "logToCSV": true,
+    "metricsInterval": 30000,
+    "healthCheckInterval": 60000
+  },
+  "riskManagement": {
+    "maxDailyVolume": 100000,
+    "maxPositionSize": 5000,
+    "stopLossPercent": 10,
+    "maxConcurrentTrades": 5
+  },
+  "ml": {
+    "lstm_epochs": 40,
+    "lstm_units": 64,
+    "learning_rate": 0.001,
+    "sequence_length": 50,
+    "prediction_horizon": 10,
+    "rl_threshold": 0.12,
+    "sentiment_model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+    "cache_duration": 300,
+    "min_confidence": 0.6,
+    "volatility_lookback": 20,
+    "max_position_size": 0.1,
+    "risk_adjustment": true
+  }
+}
