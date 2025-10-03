@@ -1,0 +1,39 @@
+{
+  "name": "vbmm-bot",
+  "version": "2.2.0",
+  "description": "Production Volume Booster & Market Making Bot for Solana",
+  "main": "vbmm-bot.js",
+  "type": "module",
+  "bin": {
+    "vbmm-bot": "./vbmm-bot.js"
+  },
+  "scripts": {
+    "start": "node vbmm-bot.js start --config ./config/trading-config.json",
+    "test": "node --test",
+    "dev": "node --watch vbmm-bot.js",
+    "setup": "node vbmm-bot.js setup"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.87.6",
+    "@jup-ag/api": "^3.1.3",
+    "commander": "^11.1.0",
+    "axios": "^1.6.2",
+    "node-cron": "^3.0.3",
+    "ws": "^8.14.2",
+    "csv-writer": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5"
+  },
+  "keywords": [
+    "solana",
+    "trading",
+    "defi",
+    "market-making",
+    "jupiter",
+    "volume-boosting"
+  ],
+  "author": "VBMM Team",
+  "license": "MIT"
+}
