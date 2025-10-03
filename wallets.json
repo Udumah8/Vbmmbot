@@ -1,0 +1,20 @@
+[
+  {
+    "privateKey": "YOUR_BASE64_ENCODED_PRIVATE_KEY_1",
+    "proxy": "http://user:pass@proxy1:8888",
+    "minBalance": 0.02,
+    "behavior": "volume_boost"
+  },
+  {
+    "privateKey": "YOUR_BASE64_ENCODED_PRIVATE_KEY_2",
+    "proxy": "http://user:pass@proxy2:8888", 
+    "minBalance": 0.03,
+    "behavior": "market_making"
+  },
+  {
+    "privateKey": "YOUR_BASE64_ENCODED_PRIVATE_KEY_3",
+    "proxy": "http://user:pass@proxy3:8888",
+    "minBalance": 0.01,
+    "behavior": "holder_focus"
+  }
+]
