@@ -1,0 +1,18 @@
+# requirements.txt
+
+# Solana
+solana>=0.32.0
+spl-token>=0.6.0
+
+# Web & API
+httpx[http2]>=0.25.0
+loguru>=0.7.0
+typer[all]>=0.9.0
+python-dotenv>=1.0.0
+pydantic>=2.4.0
+base58>=2.1.0
+
+# Machine Learning
+tensorflow>=2.13.0
+pandas>=2.0.0
+scikit-learn>=1.3.0

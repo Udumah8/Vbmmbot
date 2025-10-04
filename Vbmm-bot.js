@@ -1,15 +1,16 @@
-#!/usr/bin/env node
+
+//#!/usr/bin/env node
 
 /**
  * Volume Booster & Market Making Bot (VBMM Bot)
  * Production-Ready Final Version 2.2
- * Complete implementation with zero placeholders
+ * Enhanced with Proxy Rotation Logic
  */
 
-import { Connection, Keypair, VersionedTransaction, PublicKey, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { Jupiter, routePriceCalculator } from '@jup-ag/api';
+import { Connection, Keypair, VersionedTransaction, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import pkg from '@jup-ag/api';
+const { Jupiter } = pkg;
 import { Command } from 'commander';
-import { createHash, randomBytes, createCipheriv, createDecipheriv } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'fs';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -17,7 +18,13 @@ import { fileURLToPath } from 'url';
 import axios from 'axios';
 import cron from 'node-cron';
 import { createObjectCsvWriter } from 'csv-writer';
-import WebSocket from 'ws';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
+import http from 'http';
+import https from 'https';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,6 +34,8 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const MAX_RETRIES = 3;
 const RPC_TIMEOUT = 30000;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex'); // Use env for key in production
+const IV_LENGTH = 16;
 
 class VBMMBot {
     constructor() {
@@ -47,6 +56,7 @@ class VBMMBot {
         };
         this.proxyPool = [];
         this.currentProxyIndex = 0;
+        this.proxyStatus = new Map(); // Tracks proxy health { proxy: { lastUsed, failures, success } }
         this.priceCache = new Map();
         this.walletBalances = new Map();
     }
@@ -57,34 +67,34 @@ class VBMMBot {
     async initialize(configPath) {
         try {
             console.log('🚀 Initializing VBMM Bot v2.2 Production...');
-            
+
             // Create necessary directories
             this.createDirectories();
-            
+
             // Load configuration
             await this.loadConfiguration(configPath);
-            
+
             // Initialize RPC connection with failover
             await this.initializeConnection();
-            
+
             // Initialize Jupiter
             await this.initializeJupiter();
-            
+
             // Load and validate wallets
             await this.loadWallets();
-            
+
             // Initialize proxy pool
             await this.initializeProxyPool();
-            
+
             // Initialize ML module
             await this.initializeML();
-            
+
             // Start monitoring
             this.startMonitoring();
-            
+
             console.log('✅ VBMM Bot Production initialized successfully');
             this.metrics.startTime = Date.now();
-            
+
         } catch (error) {
             console.error('❌ Production initialization failed:', error);
             await this.emergencyShutdown();
@@ -111,18 +121,23 @@ class VBMMBot {
             maxSlippageBps: 100,
             tradeDelayMs: { min: 1000, max: 5000 },
             volumeBoost: { targetMultiplier: 5, buySellRatio: 0.7 },
-            marketMaking: { 
-                spreadTiers: [0.005, 0.01, 0.02], 
+            marketMaking: {
+                spreadTiers: [0.005, 0.01, 0.02],
                 rebalanceThreshold: 1000,
                 minSpread: 0.001,
                 maxSpread: 0.05
             },
             orbittMode: { enabled: false, surgeMultiplier: 4, minSignalStrength: 0.7 },
             wallets: { batchSize: 50, rotationStrategy: 'fisher-yates', minBalanceSOL: 0.01 },
-            monitoring: { 
-                logToCSV: true, 
+            proxyRotation: {
+                strategy: 'round-robin', // or 'random'
+                maxFailures: 3,
+                retryInterval: 300000 // 5 minutes
+            },
+            monitoring: {
+                logToCSV: true,
                 metricsInterval: 30000,
-                healthCheckInterval: 60000 
+                healthCheckInterval: 60000
             },
             riskManagement: {
                 maxDailyVolume: 100000,
@@ -141,10 +156,10 @@ class VBMMBot {
                 this.currentConfig = baseConfig;
                 this.saveConfiguration(configPath);
             }
-            
+
             // Validate configuration
             this.validateConfiguration();
-            
+
         } catch (error) {
             console.error('❌ Config load failed:', error);
             throw error;
@@ -156,8 +171,8 @@ class VBMMBot {
     }
 
     validateConfiguration() {
-        const { maxSlippageBps, volumeBoost, marketMaking } = this.currentConfig;
-        
+        const { maxSlippageBps, volumeBoost, marketMaking, proxyRotation } = this.currentConfig;
+
         if (maxSlippageBps > 500) {
             throw new Error('Slippage too high, max 500 bps allowed');
         }
@@ -167,30 +182,42 @@ class VBMMBot {
         if (marketMaking.minSpread >= marketMaking.maxSpread) {
             throw new Error('Min spread must be less than max spread');
         }
+        if (!['round-robin', 'random'].includes(proxyRotation.strategy)) {
+            throw new Error('Proxy rotation strategy must be "round-robin" or "random"');
+        }
     }
 
     async initializeConnection() {
         for (const rpcUrl of this.currentConfig.rpcUrls) {
             try {
+                const proxy = this.getNextProxy();
+                const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
                 const testConnection = new Connection(rpcUrl, {
                     commitment: 'confirmed',
                     confirmTransactionInitialTimeout: 60000,
-                    wsEndpoint: rpcUrl.replace('https', 'wss')
+                    wsEndpoint: rpcUrl.replace('https', 'wss'),
+                    httpAgent
                 });
-                
+
                 // Test connection
                 const slot = await testConnection.getSlot({ commitment: 'confirmed' });
                 console.log(`✅ RPC connected: ${rpcUrl} (slot: ${slot})`);
-                
+
                 this.connection = testConnection;
+                if (proxy) {
+                    this.updateProxyStatus(proxy, true);
+                }
                 break;
-                
+
             } catch (error) {
                 console.warn(`⚠️  RPC failed: ${rpcUrl} - ${error.message}`);
+                if (proxy) {
+                    this.updateProxyStatus(proxy, false);
+                }
                 continue;
             }
         }
-        
+
         if (!this.connection) {
             throw new Error('All RPC endpoints failed');
         }
@@ -198,19 +225,23 @@ class VBMMBot {
 
     async initializeJupiter() {
         try {
-            this.jupiter = new Jupiter({
+            const proxy = this.getNextProxy();
+            const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
+            this.jupiter = await Jupiter.load({
                 connection: this.connection,
                 cluster: 'mainnet-beta',
-                routeCacheDuration: 10000,
-                wrapUnwrapSOL: true
+                wrapUnwrapSOL: true,
+                httpAgent
             });
-            
-            // Load Jupiter tokens
-            await this.jupiter.loadTokens();
             console.log('✅ Jupiter initialized');
-            
+            if (proxy) {
+                this.updateProxyStatus(proxy, true);
+            }
         } catch (error) {
             console.error('❌ Jupiter initialization failed:', error);
+            if (proxy) {
+                this.updateProxyStatus(proxy, false);
+            }
             throw error;
         }
     }
@@ -227,22 +258,24 @@ class VBMMBot {
 
             for (const [index, walletConfig] of walletsData.entries()) {
                 try {
+                    // Decrypt private key
+                    const decryptedPrivateKey = this.decrypt(walletConfig.privateKey);
                     const keypair = Keypair.fromSecretKey(
-                        Buffer.from(walletConfig.privateKey, 'base64')
+                        Buffer.from(decryptedPrivateKey, 'base64')
                     );
-                    
+
                     // Check wallet balance
                     const balance = await this.getWalletBalance(keypair.publicKey);
                     const minBalance = walletConfig.minBalance || this.currentConfig.wallets.minBalanceSOL;
-                    
+
                     if (balance < minBalance) {
                         console.warn(`⚠️  Wallet ${index} low balance: ${balance} SOL (min: ${minBalance})`);
                         continue;
                     }
-                    
+
                     this.wallets.push({
                         keypair,
-                        proxy: walletConfig.proxy,
+                        proxy: walletConfig.proxy || '',
                         minBalance,
                         behavior: walletConfig.behavior || 'volume_boost',
                         publicKey: keypair.publicKey.toString(),
@@ -251,9 +284,9 @@ class VBMMBot {
                         balance,
                         index
                     });
-                    
+
                     this.walletBalances.set(keypair.publicKey.toString(), balance);
-                    
+
                 } catch (error) {
                     console.warn(`⚠️  Failed to load wallet ${index}: ${error.message}`);
                 }
@@ -264,7 +297,7 @@ class VBMMBot {
             }
 
             console.log(`✅ Loaded ${this.wallets.length} wallets with sufficient balance`);
-            
+
         } catch (error) {
             console.error('❌ Wallet load failed:', error);
             throw error;
@@ -273,10 +306,22 @@ class VBMMBot {
 
     async getWalletBalance(publicKey) {
         try {
-            const balance = await this.connection.getBalance(publicKey);
+            const proxy = this.getNextProxy();
+            const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
+            const connection = new Connection(this.currentConfig.rpcUrls[0], {
+                commitment: 'confirmed',
+                httpAgent
+            });
+            const balance = await connection.getBalance(publicKey);
+            if (proxy) {
+                this.updateProxyStatus(proxy, true);
+            }
             return balance / LAMPORTS_PER_SOL;
         } catch (error) {
             console.warn(`Balance check failed for ${publicKey}: ${error.message}`);
+            if (proxy) {
+                this.updateProxyStatus(proxy, false);
+            }
             return 0;
         }
     }
@@ -284,30 +329,131 @@ class VBMMBot {
     async initializeProxyPool() {
         // Extract proxies from wallet config
         const proxies = [...new Set(this.wallets.map(w => w.proxy).filter(Boolean))];
-        
+
         if (proxies.length === 0) {
             console.log('⚠️  No proxies configured, using direct connections');
             return;
         }
-        
+
         // Test each proxy
         for (const proxy of proxies) {
             try {
+                const [host, port] = proxy.replace('http://', '').split(':');
                 const response = await axios.get('https://api.mainnet-beta.solana.com/health', {
-                    proxy: { host: proxy.split(':')[0], port: parseInt(proxy.split(':')[1]) },
+                    proxy: { host, port: parseInt(port) },
                     timeout: 10000
                 });
-                
+
                 if (response.data === 'ok') {
                     this.proxyPool.push(proxy);
+                    this.proxyStatus.set(proxy, { lastUsed: 0, failures: 0, success: 0 });
                     console.log(`✅ Proxy active: ${proxy}`);
                 }
             } catch (error) {
-                console.warn(`⚠️  Proxy failed: ${proxy}`);
+                console.warn(`⚠️  Proxy failed: ${proxy} - ${error.message}`);
+                this.proxyStatus.set(proxy, { lastUsed: 0, failures: 1, success: 0 });
             }
         }
-        
+
         console.log(`✅ ${this.proxyPool.length} proxies available`);
+
+        // Schedule proxy re-testing
+        cron.schedule('*/5 * * * *', () => {
+            this.retestFailedProxies();
+        });
+    }
+
+    getNextProxy() {
+        if (this.proxyPool.length === 0) {
+            return null;
+        }
+
+        const strategy = this.currentConfig.proxyRotation.strategy;
+        const maxFailures = this.currentConfig.proxyRotation.maxFailures;
+
+        // Filter out proxies that have exceeded max failures
+        const availableProxies = this.proxyPool.filter(proxy => {
+            const status = this.proxyStatus.get(proxy);
+            return status.failures < maxFailures;
+        });
+
+        if (availableProxies.length === 0) {
+            console.warn('⚠️  No available proxies');
+            return null;
+        }
+
+        let selectedProxy;
+        if (strategy === 'random') {
+            const index = Math.floor(Math.random() * availableProxies.length);
+            selectedProxy = availableProxies[index];
+        } else {
+            // Round-robin
+            this.currentProxyIndex = (this.currentProxyIndex + 1) % availableProxies.length;
+            selectedProxy = availableProxies[this.currentProxyIndex];
+        }
+
+        this.proxyStatus.set(selectedProxy, {
+            ...this.proxyStatus.get(selectedProxy),
+            lastUsed: Date.now()
+        });
+
+        console.log(`🔄 Using proxy: ${selectedProxy}`);
+        return selectedProxy;
+    }
+
+    updateProxyStatus(proxy, success) {
+        if (!this.proxyStatus.has(proxy)) {
+            this.proxyStatus.set(proxy, { lastUsed: Date.now(), failures: 0, success: 0 });
+        }
+
+        const status = this.proxyStatus.get(proxy);
+        if (success) {
+            this.proxyStatus.set(proxy, {
+                ...status,
+                success: status.success + 1,
+                failures: Math.max(0, status.failures - 1)
+            });
+        } else {
+            this.proxyStatus.set(proxy, {
+                ...status,
+                failures: status.failures + 1
+            });
+        }
+    }
+
+    async retestFailedProxies() {
+        const maxFailures = this.currentConfig.proxyRotation.maxFailures;
+        const retryInterval = this.currentConfig.proxyRotation.retryInterval;
+
+        for (const proxy of this.proxyPool) {
+            const status = this.proxyStatus.get(proxy);
+            if (status.failures >= maxFailures && Date.now() - status.lastUsed > retryInterval) {
+                try {
+                    const [host, port] = proxy.replace('http://', '').split(':');
+                    const response = await axios.get('https://api.mainnet-beta.solana.com/health', {
+                        proxy: { host, port: parseInt(port) },
+                        timeout: 10000
+                    });
+
+                    if (response.data === 'ok') {
+                        this.proxyStatus.set(proxy, {
+                            ...status,
+                            failures: 0,
+                            success: status.success + 1,
+                            lastUsed: Date.now()
+                        });
+                        console.log(`✅ Proxy recovered: ${proxy}`);
+                    }
+                } catch (error) {
+                    console.warn(`⚠️  Proxy retest failed: ${proxy} - ${error.message}`);
+                    this.proxyStatus.set(proxy, {
+                        ...status,
+                        failures: status.failures + 1,
+                        lastUsed: Date.now()
+                    });
+                }
+            }
+        }
     }
 
     async initializeML() {
@@ -339,7 +485,7 @@ class VBMMBot {
                     resolve(); // ML is optional
                 }
             });
-            
+
             // Timeout after 10 seconds
             setTimeout(() => {
                 pythonProcess.kill();
@@ -363,8 +509,8 @@ class VBMMBot {
 
     getNextWallet(tradeType = 'volume_boost', minBalance = 0.01) {
         const now = Date.now();
-        const availableWallets = this.wallets.filter(w => 
-            w.behavior === tradeType && 
+        const availableWallets = this.wallets.filter(w =>
+            w.behavior === tradeType &&
             w.balance >= minBalance &&
             w.lastUsed < now - 60000 // 1 minute cooldown
         );
@@ -379,7 +525,7 @@ class VBMMBot {
     }
 
     /**
-     * Production-grade trade execution with full error handling
+     * Production-grade trade execution with full error handling and proxy rotation
      */
     async executeVolumeBoostTrade(inputToken, outputToken, amount) {
         if (this.emergencyStop) {
@@ -396,92 +542,83 @@ class VBMMBot {
 
         while (retries < MAX_RETRIES) {
             try {
+                const proxy = this.getNextProxy();
+                const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
+
                 // Get fresh quote
-                const quote = await this.jupiter.computeRoutes({
+                const quoteResponse = await this.jupiter.computeRoutes({
                     inputMint: new PublicKey(inputToken),
                     outputMint: new PublicKey(outputToken),
-                    amount: Math.floor(amount), // Ensure integer
+                    amount: amount,
                     slippageBps: this.currentConfig.maxSlippageBps,
                     feeBps: 0,
-                    onlyDirectRoutes: false
+                    onlyDirectRoutes: false,
+                    httpAgent
                 });
 
-                if (!quote.routes || quote.routes.length === 0) {
+                const bestRoute = quoteResponse.routesInfos[0]; // v6 uses routesInfos
+
+                if (!bestRoute) {
                     throw new Error('No routes available from Jupiter');
                 }
 
-                const bestRoute = quote.routes[0];
-                
-                // Validate route
-                if (!bestRoute.inAmount || !bestRoute.outAmount) {
-                    throw new Error('Invalid route: missing amounts');
-                }
-
                 // Prepare transaction
-                const { swapTransaction } = await this.jupiter.exchange({
+                const swapTransaction = await this.jupiter.swap({
                     routeInfo: bestRoute,
                     userPublicKey: wallet.keypair.publicKey,
-                    dynamicComputeUnitLimit: true,
-                    dynamicSlippage: true,
-                    prioritizationFeeLamports: 'auto'
+                    httpAgent
                 });
 
-                if (!swapTransaction) {
-                    throw new Error('Failed to prepare swap transaction');
-                }
-
-                // Deserialize and sign
-                const transaction = VersionedTransaction.deserialize(
-                    Buffer.from(swapTransaction, 'base64')
-                );
+                // Sign and send
+                const swapTransactionBuf = Buffer.from(swapTransaction.swapTransaction, 'base64');
+                const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
                 transaction.sign([wallet.keypair]);
 
-                // Send transaction
-                const signature = await this.connection.sendTransaction(transaction, {
-                    maxRetries: 3,
-                    skipPreflight: false,
-                    preflightCommitment: 'confirmed'
+                const latestBlockHash = await this.connection.getLatestBlockhash();
+                const rawTransaction = transaction.serialize();
+
+                const txid = await this.connection.sendRawTransaction(rawTransaction, {
+                    skipPreflight: true,
+                    maxRetries: 2
                 });
 
-                // Wait for confirmation with timeout
-                const confirmation = await this.connection.confirmTransaction({
-                    signature,
-                    blockhash: transaction.message.recentBlockhash,
-                    lastValidBlockHeight: transaction.message.lastValidBlockHeight
-                }, 'confirmed');
+                await this.connection.confirmTransaction({
+                    signature: txid,
+                    blockhash: latestBlockHash.blockhash,
+                    lastValidBlockHeight: latestBlockHash.lastValidBlockHeight
+                });
 
-                if (confirmation.value.err) {
-                    throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-                }
+                console.log(`✅ Success: https://solscan.io/tx/${txid}`);
 
-                // Update wallet balance
+                // Update metrics
                 const newBalance = await this.getWalletBalance(wallet.keypair.publicKey);
                 wallet.balance = newBalance;
                 this.walletBalances.set(wallet.publicKey, newBalance);
 
-                // Calculate fees
-                const txDetails = await this.connection.getTransaction(signature, {
+                // Fetch fee
+                const txDetails = await this.connection.getTransaction(txid, {
                     commitment: 'confirmed',
                     maxSupportedTransactionVersion: 0
                 });
-                
+
                 const fee = txDetails?.meta?.fee ? txDetails.meta.fee / LAMPORTS_PER_SOL : 0;
                 this.metrics.totalFees += fee;
 
-                // Log successful trade
+                // Log
                 const tradeData = {
                     type: 'volume_boost',
                     wallet: wallet.publicKey,
                     inputToken,
                     outputToken,
                     amount,
-                    inputAmount: bestRoute.inAmount,
-                    outputAmount: bestRoute.outAmount,
-                    signature,
-                    price: Number(bestRoute.outAmount) / Number(bestRoute.inAmount),
+                    inputAmount: bestRoute.inAmountInLamports,
+                    outputAmount: bestRoute.outAmountInLamports,
+                    signature: txid,
+                    price: Number(bestRoute.outAmountInLamports) / Number(bestRoute.inAmountInLamports),
                     fee,
                     timestamp: Date.now(),
-                    retries
+                    retries,
+                    proxy
                 };
 
                 this.logTrade(tradeData);
@@ -491,18 +628,25 @@ class VBMMBot {
                 this.metrics.tradesExecuted++;
                 this.metrics.volumeTraded += amount / LAMPORTS_PER_SOL;
 
-                return { 
-                    success: true, 
-                    signature, 
-                    route: bestRoute,
-                    inputAmount: bestRoute.inAmount,
-                    outputAmount: bestRoute.outAmount
+                if (proxy) {
+                    this.updateProxyStatus(proxy, true);
+                }
+
+                return {
+                    success: true,
+                    signature: txid,
+                    inputAmount: bestRoute.inAmountInLamports,
+                    outputAmount: bestRoute.outAmountInLamports
                 };
 
             } catch (error) {
                 lastError = error;
                 retries++;
-                
+
+                if (proxy) {
+                    this.updateProxyStatus(proxy, false);
+                }
+
                 if (retries < MAX_RETRIES) {
                     const delay = Math.pow(2, retries) * 1000; // Exponential backoff
                     console.warn(`⚠️  Trade attempt ${retries} failed, retrying in ${delay}ms:`, error.message);
@@ -537,10 +681,10 @@ class VBMMBot {
             // Calculate dynamic parameters
             const spread = this.calculateDynamicSpread(mlSignal, marketData.volatility);
             const amount = this.calculateMarketMakingAmount(baseAmount, spread, mlSignal);
-            
+
             // Execute with market making logic
             const result = await this.executeVolumeBoostTrade(inputToken, outputToken, amount);
-            
+
             // Rebalance if needed
             await this.checkRebalance(wallet, inputToken, outputToken);
 
@@ -569,26 +713,34 @@ class VBMMBot {
 
     async getRealMarketData(inputToken, outputToken) {
         try {
+            const proxy = this.getNextProxy();
+            const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
+
             // Get recent trades from Jupiter
-            const quote = await this.jupiter.computeRoutes({
+            const quoteResponse = await this.jupiter.computeRoutes({
                 inputMint: new PublicKey(inputToken),
                 outputMint: new PublicKey(outputToken),
-                amount: 1000000, // 1 SOL equivalent
+                amount: 1000000, // 0.001 SOL
                 slippageBps: 50,
-                onlyDirectRoutes: true
+                onlyDirectRoutes: true,
+                httpAgent
             });
 
-            const routes = quote.routes || [];
-            const prices = routes.map(route => 
-                Number(route.outAmount) / Number(route.inAmount)
+            const routes = quoteResponse.routesInfos || [];
+            const prices = routes.map(route =>
+                Number(route.outAmountInLamports) / Number(route.inAmountInLamports)
             );
 
             // Calculate volatility from recent price movements
             const volatility = this.calculateRealVolatility(prices);
-            
+
             // Get volume data (simplified - in production use DEX APIs)
-            const volume = routes.reduce((sum, route) => sum + Number(route.inAmount), 0);
-            
+            const volume = routes.reduce((sum, route) => sum + Number(route.inAmountInLamports), 0);
+
+            if (proxy) {
+                this.updateProxyStatus(proxy, true);
+            }
+
             return {
                 timestamp: Date.now(),
                 inputToken,
@@ -602,13 +754,16 @@ class VBMMBot {
             };
         } catch (error) {
             console.warn('Market data fetch failed, using fallback:', error.message);
+            if (proxy) {
+                this.updateProxyStatus(proxy, false);
+            }
             return this.getFallbackMarketData();
         }
     }
 
     calculateRealVolatility(prices) {
         if (prices.length < 2) return 0.01;
-        
+
         const mean = prices.reduce((a, b) => a + b) / prices.length;
         const variance = prices.reduce((acc, price) => acc + Math.pow(price - mean, 2), 0) / prices.length;
         return Math.sqrt(variance) / mean;
@@ -616,10 +771,10 @@ class VBMMBot {
 
     calculateBidAskSpread(routes) {
         if (routes.length < 2) return 0.01;
-        
-        const bestBuy = Number(routes[0].outAmount) / Number(routes[0].inAmount);
-        const bestSell = Number(routes[1].outAmount) / Number(routes[1].inAmount);
-        
+
+        const bestBuy = Number(routes[0].outAmountInLamports) / Number(routes[0].inAmountInLamports);
+        const bestSell = Number(routes[1].outAmountInLamports) / Number(routes[1].inAmountInLamports);
+
         return Math.abs(bestBuy - bestSell) / ((bestBuy + bestSell) / 2);
     }
 
@@ -640,9 +795,9 @@ class VBMMBot {
         const signalAdjustment = (0.5 - mlSignal.signal) * 0.005;
         const volatilityAdjustment = volatility * 0.02;
         const confidenceAdjustment = (0.5 - mlSignal.confidence) * 0.003;
-        
+
         const rawSpread = baseSpread + signalAdjustment + volatilityAdjustment + confidenceAdjustment;
-        
+
         return Math.max(
             this.currentConfig.marketMaking.minSpread,
             Math.min(this.currentConfig.marketMaking.maxSpread, rawSpread)
@@ -653,16 +808,15 @@ class VBMMBot {
         const confidenceMultiplier = mlSignal.confidence || 0.5;
         const signalMultiplier = 1 + (mlSignal.signal - 0.5) * 0.2;
         const spreadMultiplier = 1 + spread * 10; // Higher spread = smaller trades
-        
+
         return baseAmount * confidenceMultiplier * signalMultiplier / spreadMultiplier;
     }
 
     async checkRebalance(wallet, inputToken, outputToken) {
-        // Check if wallet needs rebalancing
         const currentBalance = wallet.balance;
         if (currentBalance < wallet.minBalance) {
             console.log(`🔄 Rebalancing wallet ${wallet.publicKey.substring(0, 8)}...`);
-            // Implementation would rebalance from another wallet or external source
+            // In production, implement rebalance logic, e.g., transfer from master wallet
         }
     }
 
@@ -713,10 +867,10 @@ class VBMMBot {
                         amount: amountPerWallet,
                         signature: result.signature
                     });
-                    
+
                     // Staggered delays for organic appearance
                     await this.delay(500 + Math.random() * 1500);
-                    
+
                 } catch (error) {
                     console.warn(`⚠️  Surge trade failed for wallet ${wallet.publicKey}: ${error.message}`);
                     results.push({
@@ -730,9 +884,9 @@ class VBMMBot {
             const successfulTrades = results.filter(r => r.success).length;
             console.log(`✅ Orbitt Surge completed: ${successfulTrades}/${surgeWallets.length} successful trades`);
 
-            return { 
-                surge: true, 
-                results, 
+            return {
+                surge: true,
+                results,
                 multiplier: surgeMultiplier,
                 totalAmount: surgeAmount
             };
@@ -757,7 +911,7 @@ class VBMMBot {
         }
 
         const amountPerWallet = totalAmount / availableWallets.length;
-        
+
         if (amountPerWallet < 50000) { // Minimum ~0.0005 SOL worth
             throw new Error(`Amount per wallet too small: ${amountPerWallet}, minimum 50000 lamports`);
         }
@@ -831,7 +985,7 @@ class VBMMBot {
                     output += data.toString();
                 });
 
-                pythonProcess.stderr.on('data', (data) {
+                pythonProcess.stderr.on('data', (data) => {
                     error += data.toString();
                 });
 
@@ -872,7 +1026,7 @@ class VBMMBot {
 
         // JSON logging
         appendFileSync(
-            path.join(__dirname, 'logs', 'trades.jsonl'), 
+            path.join(__dirname, 'logs', 'trades.jsonl'),
             JSON.stringify(logEntry) + '\n'
         );
 
@@ -888,23 +1042,24 @@ class VBMMBot {
                 { id: 'amount', title: 'Amount' },
                 { id: 'signature', title: 'Signature' },
                 { id: 'price', title: 'Price' },
-                { id: 'fee', title: 'Fee' }
+                { id: 'fee', title: 'Fee' },
+                { id: 'proxy', title: 'Proxy' }
             ];
 
             if (!existsSync(csvPath)) {
                 const csvWriter = createObjectCsvWriter({ path: csvPath, header: csvHeader });
                 csvWriter.writeRecords([logEntry]).catch(console.error);
             } else {
-                const csvWriter = createObjectCsvWriter({ 
-                    path: csvPath, 
+                const csvWriter = createObjectCsvWriter({
+                    path: csvPath,
                     header: csvHeader,
-                    append: true 
+                    append: true
                 });
                 csvWriter.writeRecords([logEntry]).catch(console.error);
             }
         }
 
-        console.log(`✅ ${tradeData.type} | ${(tradeData.amount / LAMPORTS_PER_SOL).toFixed(4)} SOL | ${tradeData.wallet.substring(0, 8)}...`);
+        console.log(`✅ ${tradeData.type} | ${(tradeData.amount / LAMPORTS_PER_SOL).toFixed(4)} SOL | ${tradeData.wallet.substring(0, 8)}... | Proxy: ${tradeData.proxy || 'None'}`);
     }
 
     logError(context, error, wallet = 'unknown') {
@@ -917,7 +1072,7 @@ class VBMMBot {
         };
 
         appendFileSync(
-            path.join(__dirname, 'logs', 'errors.jsonl'), 
+            path.join(__dirname, 'logs', 'errors.jsonl'),
             JSON.stringify(errorEntry) + '\n'
         );
 
@@ -928,23 +1083,23 @@ class VBMMBot {
      * Monitoring and health checks
      */
     startMonitoring() {
-        // Metrics logging
+        // Metrics logging every 30 seconds
         cron.schedule('*/30 * * * * *', () => {
             this.logMetrics();
         });
 
-        // Health checks
+        // Health checks every 60 seconds
         cron.schedule('*/60 * * * * *', () => {
             this.healthCheck();
         });
 
-        // Wallet balance monitoring
-        cron.schedule('*/300 * * * * *', () => {
+        // Wallet balance monitoring every 5 minutes
+        cron.schedule('*/5 * * * *', () => {
             this.monitorWalletBalances();
         });
     }
 
-    async logMetrics() {
+    logMetrics() {
         const metrics = this.getMetrics();
         appendFileSync(
             path.join(__dirname, 'logs', 'metrics.jsonl'),
@@ -956,22 +1111,32 @@ class VBMMBot {
         try {
             // Check RPC connection
             await this.connection.getSlot();
-            
+
             // Check Jupiter
+            const proxy = this.getNextProxy();
+            const httpAgent = proxy ? new SocksProxyAgent(proxy) : null;
             await this.jupiter.computeRoutes({
                 inputMint: new PublicKey(SOL_MINT),
                 outputMint: new PublicKey(USDC_MINT),
                 amount: 1000000,
-                slippageBps: 100
+                slippageBps: 100,
+                httpAgent
             });
 
             // Check wallet accessibility
             if (this.wallets.length > 0) {
-                await this.connection.getBalance(this.wallets[0].keypair.publicKey);
+                await this.getWalletBalance(this.wallets[0].keypair.publicKey);
+            }
+
+            if (proxy) {
+                this.updateProxyStatus(proxy, true);
             }
 
         } catch (error) {
             console.error('❌ Health check failed:', error.message);
+            if (proxy) {
+                this.updateProxyStatus(proxy, false);
+            }
             this.logError('health_check', error);
         }
     }
@@ -1000,28 +1165,26 @@ class VBMMBot {
         this.emergencyStop = true;
         this.isRunning = false;
         this.tradeQueue = [];
-        
+
         const stopLog = {
             timestamp: new Date().toISOString(),
             action: 'EMERGENCY_STOP',
             metrics: this.getMetrics()
         };
-        
+
         writeFileSync(
             path.join(__dirname, 'logs', 'emergency_stop.json'),
             JSON.stringify(stopLog, null, 2)
         );
-        
+
         console.log('✅ Emergency stop logged and activated');
     }
 
     async emergencyShutdown() {
         this.emergencyStop();
-        
+
         // Additional cleanup
         try {
-            // Cancel any pending transactions
-            // Close connections
             console.log('🛑 Emergency shutdown completed');
         } catch (error) {
             console.error('Emergency shutdown error:', error);
@@ -1033,16 +1196,16 @@ class VBMMBot {
             console.log('ℹ️  No emergency stop active');
             return;
         }
-        
+
         console.log('🟢 Resuming from emergency stop...');
         this.emergencyStop = false;
-        
+
         const resumeLog = {
             timestamp: new Date().toISOString(),
             action: 'RESUME',
             metrics: this.getMetrics()
         };
-        
+
         appendFileSync(
             path.join(__dirname, 'logs', 'operations.jsonl'),
             JSON.stringify(resumeLog) + '\n'
@@ -1064,8 +1227,8 @@ class VBMMBot {
         const uptime = Date.now() - this.metrics.startTime;
         const totalTrades = this.metrics.tradesExecuted + this.metrics.failures;
         const successRate = totalTrades > 0 ? (this.metrics.tradesExecuted / totalTrades) * 100 : 0;
-        
-        const activeWallets = this.wallets.filter(w => 
+
+        const activeWallets = this.wallets.filter(w =>
             w.lastUsed > Date.now() - 3600000
         ).length;
 
@@ -1081,6 +1244,10 @@ class VBMMBot {
             wallets: {
                 total: this.wallets.length,
                 active: activeWallets
+            },
+            proxies: {
+                total: this.proxyPool.length,
+                active: this.proxyPool.filter(p => this.proxyStatus.get(p).failures < this.currentConfig.proxyRotation.maxFailures).length
             },
             timestamp: new Date().toISOString()
         };
@@ -1101,11 +1268,11 @@ class VBMMBot {
             while (this.isRunning && !this.emergencyStop) {
                 try {
                     await this.executeStrategyCycle(strategyConfig);
-                    
+
                     // Adaptive delay based on strategy
                     const delay = this.calculateStrategyDelay(strategyConfig);
                     await this.delay(delay);
-                    
+
                 } catch (error) {
                     console.error('❌ Strategy cycle failed:', error);
                     await this.delay(30000); // Wait 30 seconds before retry
@@ -1119,32 +1286,32 @@ class VBMMBot {
 
     async executeStrategyCycle(strategyConfig) {
         const amount = this.calculateDynamicAmount(strategyConfig.baseAmount, strategyConfig.mode);
-        
+
         switch (strategyConfig.mode) {
             case 'volume_boost':
                 await this.executeVolumeBoostTrade(
-                    strategyConfig.inputToken, 
-                    strategyConfig.outputToken, 
+                    strategyConfig.inputToken,
+                    strategyConfig.outputToken,
                     amount
                 );
                 break;
-                
+
             case 'market_making':
                 await this.executeMarketMakingTrade(
-                    strategyConfig.inputToken, 
-                    strategyConfig.outputToken, 
+                    strategyConfig.inputToken,
+                    strategyConfig.outputToken,
                     amount
                 );
                 break;
-                
+
             case 'orbitt_mode':
                 await this.executeOrbittMode(
-                    strategyConfig.inputToken, 
-                    strategyConfig.outputToken, 
+                    strategyConfig.inputToken,
+                    strategyConfig.outputToken,
                     amount
                 );
                 break;
-                
+
             case 'holder_growth':
                 await this.executeHolderGrowthStrategy(
                     strategyConfig.tokenMint,
@@ -1152,7 +1319,7 @@ class VBMMBot {
                     strategyConfig.targetHolders
                 );
                 break;
-                
+
             default:
                 throw new Error(`Unknown strategy: ${strategyConfig.mode}`);
         }
@@ -1165,7 +1332,7 @@ class VBMMBot {
             'orbitt_mode': { min: 30000, max: 60000 },
             'holder_growth': { min: 60000, max: 300000 }
         };
-        
+
         const base = baseDelays[strategyConfig.mode] || { min: 10000, max: 30000 };
         return base.min + Math.random() * (base.max - base.min);
     }
@@ -1178,7 +1345,7 @@ class VBMMBot {
             'orbitt_mode': 2.0,
             'holder_growth': 0.1
         };
-        
+
         return Math.floor(baseAmount * randomFactor * (strategyMultipliers[strategy] || 1.0));
     }
 
@@ -1192,31 +1359,45 @@ class VBMMBot {
      */
     async generateWallets(count = 10) {
         const wallets = [];
-        
+
         for (let i = 0; i < count; i++) {
             const keypair = Keypair.generate();
+            const privateKeyBase64 = Buffer.from(keypair.secretKey).toString('base64');
+            const encryptedPrivateKey = this.encrypt(privateKeyBase64);
             const wallet = {
-                privateKey: Buffer.from(keypair.secretKey).toString('base64'),
-                proxy: `http://proxy-${i}:8888`,
+                privateKey: encryptedPrivateKey,
+                proxy: '', // In production, set real proxies
                 minBalance: 0.01,
-                behavior: i < count * 0.6 ? 'volume_boost' : 
+                behavior: i < count * 0.6 ? 'volume_boost' :
                          i < count * 0.8 ? 'market_making' : 'holder_focus'
             };
             wallets.push(wallet);
         }
-        
+
         return wallets;
     }
 
     async saveWallets(wallets, filePath) {
-        const encryptedWallets = wallets.map(wallet => ({
-            ...wallet,
-            // In production, encrypt private keys
-            privateKey: wallet.privateKey
-        }));
-        
-        writeFileSync(filePath, JSON.stringify(encryptedWallets, null, 2));
+        writeFileSync(filePath, JSON.stringify(wallets, null, 2));
         console.log(`✅ Saved ${wallets.length} wallets to ${filePath}`);
+    }
+
+    encrypt(text) {
+        const iv = crypto.randomBytes(IV_LENGTH);
+        const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+        let encrypted = cipher.update(text);
+        encrypted = Buffer.concat([encrypted, cipher.final()]);
+        return iv.toString('hex') + ':' + encrypted.toString('hex');
+    }
+
+    decrypt(text) {
+        const textParts = text.split(':');
+        const iv = Buffer.from(textParts.shift(), 'hex');
+        const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+        const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+        let decrypted = decipher.update(encryptedText);
+        decrypted = Buffer.concat([decrypted, decipher.final()]);
+        return decrypted.toString();
     }
 }
 
@@ -1251,24 +1432,24 @@ function setupCLI() {
         .action(async (options) => {
             try {
                 console.log('🛠️  Setting up VBMM Bot...');
-                
+
                 // Generate wallets
                 const walletCount = parseInt(options.wallets);
                 const wallets = await bot.generateWallets(walletCount);
-                
+
                 // Save wallets
                 const walletPath = path.join(__dirname, 'config', 'wallets.json');
                 await bot.saveWallets(wallets, walletPath);
-                
+
                 // Create default config
                 const configPath = path.join(__dirname, 'config', 'trading-config.json');
                 bot.saveConfiguration(configPath);
-                
+
                 console.log('✅ Setup completed!');
                 console.log(`📁 Wallets: ${walletPath}`);
                 console.log(`📁 Config: ${configPath}`);
                 console.log('\nNext: Fund wallets and run "vbmm-bot init -c config/trading-config.json"');
-                
+
             } catch (error) {
                 console.error('❌ Setup failed:', error);
                 process.exit(1);
@@ -1285,7 +1466,7 @@ function setupCLI() {
         .action(async (options) => {
             try {
                 await bot.initialize('./config/trading-config.json');
-                
+
                 let result;
                 switch (options.mode) {
                     case 'market':
@@ -1295,14 +1476,14 @@ function setupCLI() {
                         result = await bot.executeOrbittMode(options.from, options.to, options.amount);
                         break;
                     default:
-                        result = await bot.executeVolumeBoostTrade(options.from, options.to, options.amount);
+                        result = await this.executeVolumeBoostTrade(options.from, options.to, options.amount);
                 }
-                
+
                 console.log('✅ Trade executed successfully');
                 console.log(`📄 Signature: ${result.signature}`);
                 console.log(`💸 Input: ${result.inputAmount} lamports`);
                 console.log(`🎯 Output: ${result.outputAmount} lamports`);
-                
+
             } catch (error) {
                 console.error('❌ Trade failed:', error.message);
                 process.exit(1);
@@ -1320,7 +1501,7 @@ function setupCLI() {
         .action(async (options) => {
             try {
                 await bot.initialize('./config/trading-config.json');
-                
+
                 const strategyConfig = {
                     mode: options.mode,
                     inputToken: options.from,
@@ -1329,10 +1510,10 @@ function setupCLI() {
                     targetHolders: parseInt(options.targetHolders),
                     totalAmount: options.amount
                 };
-                
+
                 console.log(`🚀 Starting ${strategyConfig.mode} strategy...`);
                 await bot.startTrading(strategyConfig);
-                
+
             } catch (error) {
                 console.error('❌ Strategy start failed:', error.message);
                 process.exit(1);
@@ -1353,10 +1534,10 @@ function setupCLI() {
                     options.amount,
                     options.count
                 );
-                
+
                 console.log(`✅ Holder growth completed: ${results.successful}/${results.totalAttempted} successful`);
                 console.log(`📈 New holders: ${results.successful}`);
-                
+
             } catch (error) {
                 console.error('❌ Holder growth failed:', error.message);
                 process.exit(1);
@@ -1418,14 +1599,14 @@ function setupCLI() {
 }
 
 // Main execution
-if (import.meta.url === `file://${process.argv[1]}`) {
+//console.log('VBMM Bot started at:', new Date().toISOString());
+
+if (import.meta.url != `file://${process.argv[1]}`) {
     const program = setupCLI();
-    
     program.configureOutput({
         writeOut: (str) => process.stdout.write(`[VBMM] ${str}`),
         writeErr: (str) => process.stderr.write(`[ERROR] ${str}`)
     });
-    
     program.parse();
 }
 
